@@ -3,6 +3,13 @@
 import { GoogleSpreadsheet } from "google-spreadsheet";
 import { JWT } from "google-auth-library";
 
+export interface SaveToSheetsPayload {
+  marka: string;
+  urunAdi: string;
+  barkod?: string;
+  stok: number;
+}
+
 export interface SaveToSheetsResponse {
   success: boolean;
   message?: string;
@@ -10,22 +17,31 @@ export interface SaveToSheetsResponse {
 }
 
 export async function saveToSheets(
-  markaOrPayload: string | { marka: string; urunAdi: string; stok: number },
+  markaOrPayload: string | SaveToSheetsPayload,
   urunAdiArg?: string,
+  barkodOrStokArg?: string | number,
   stokArg?: number
 ): Promise<SaveToSheetsResponse> {
   let marka: string;
   let urunAdi: string;
+  let barkod: string;
   let stok: number;
 
   if (typeof markaOrPayload === "object" && markaOrPayload !== null) {
     marka = markaOrPayload.marka || "";
     urunAdi = markaOrPayload.urunAdi || "";
+    barkod = markaOrPayload.barkod || "";
     stok = Number(markaOrPayload.stok) || 0;
   } else {
     marka = markaOrPayload || "";
     urunAdi = urunAdiArg || "";
-    stok = Number(stokArg) || 0;
+    if (typeof barkodOrStokArg === "number") {
+      barkod = "";
+      stok = barkodOrStokArg;
+    } else {
+      barkod = (barkodOrStokArg as string) || "";
+      stok = Number(stokArg) || 0;
+    }
   }
 
   const serviceAccountEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
@@ -46,7 +62,7 @@ export async function saveToSheets(
     };
   }
 
-  // Ensure \\n in private key is correctly converted to actual newlines
+  // Ensure \n in private key is correctly converted to actual newlines
   const privateKey = rawPrivateKey.replace(/\\n/g, "\n");
 
   try {
@@ -73,16 +89,18 @@ export async function saveToSheets(
     // Timestamp formatted according to Turkish locale
     const timestamp = new Date().toLocaleString("tr-TR");
 
-    // Ensure header row is loaded or set if sheet is blank
+    // Ensure header row is set to ["Marka", "Ürün Adı", "Barkod", "Stok", "Zaman Damgası"]
     try {
       await sheet.loadHeaderRow();
+      if (!sheet.headerValues || sheet.headerValues.length < 5 || !sheet.headerValues.includes("Barkod")) {
+        await sheet.setHeaderRow(["Marka", "Ürün Adı", "Barkod", "Stok", "Zaman Damgası"]);
+      }
     } catch {
-      // If sheet has no header row yet, initialize Column A, B, C, D headers
-      await sheet.setHeaderRow(["Marka", "Ürün Adı", "Stok", "Zaman Damgası"]);
+      await sheet.setHeaderRow(["Marka", "Ürün Adı", "Barkod", "Stok", "Zaman Damgası"]);
     }
 
-    // Append row mapping exactly: Column A = marka, Column B = urunAdi, Column C = stok, Column D = timestamp
-    await sheet.addRow([marka, urunAdi, stok, timestamp]);
+    // Append row mapping exactly: ["Marka", "Ürün Adı", "Barkod", "Stok", "Zaman Damgası"]
+    await sheet.addRow([marka, urunAdi, barkod, stok, timestamp]);
 
     return {
       success: true,
@@ -98,4 +116,3 @@ export async function saveToSheets(
     };
   }
 }
-

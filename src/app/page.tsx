@@ -17,6 +17,7 @@ import {
   Sparkles,
   Loader2,
   ScanLine,
+  Barcode,
 } from "lucide-react";
 import { processImage } from "@/actions/process-image";
 import { saveToSheets } from "@/actions/save-to-sheets";
@@ -26,6 +27,7 @@ type AppState = "camera" | "form";
 interface FormData {
   brand: string;
   productName: string;
+  barcode: string;
   stockQuantity: string;
 }
 
@@ -38,6 +40,7 @@ export default function InventoryPage() {
   const [formData, setFormData] = useState<FormData>({
     brand: "",
     productName: "",
+    barcode: "",
     stockQuantity: "",
   });
 
@@ -169,11 +172,13 @@ export default function InventoryPage() {
 
       const brand = typeof result?.marka === "string" ? result.marka.trim() : "";
       const product = typeof result?.urunAdi === "string" ? result.urunAdi.trim() : "";
+      const barcode = typeof result?.barkod === "string" ? result.barkod.trim() : "";
 
-      if (brand || product) {
+      if (brand || product || barcode) {
         setFormData({
           brand: brand || "Bilinmiyor",
           productName: product || "",
+          barcode: barcode || "",
           stockQuantity: "",
         });
         setAiDetected(true);
@@ -181,6 +186,7 @@ export default function InventoryPage() {
         setFormData({
           brand: "",
           productName: "",
+          barcode: "",
           stockQuantity: "",
         });
       }
@@ -193,6 +199,7 @@ export default function InventoryPage() {
       setFormData({
         brand: "",
         productName: "",
+        barcode: "",
         stockQuantity: "",
       });
     } finally {
@@ -221,18 +228,9 @@ export default function InventoryPage() {
     // Maksimum 640x480 piksele ölçekleme (Scale Down - aspect ratio korunarak)
     const MAX_WIDTH = 640;
     const MAX_HEIGHT = 480;
-    let targetWidth = rawWidth;
-    let targetHeight = rawHeight;
-
-    if (targetWidth > MAX_WIDTH || targetHeight > MAX_HEIGHT) {
-      const ratio = Math.min(MAX_WIDTH / targetWidth, MAX_HEIGHT / targetHeight);
-      targetWidth = Math.round(targetWidth * ratio);
-      targetHeight = Math.round(targetHeight * ratio);
-    }
-
-    // Kesin sınır kontrolü
-    targetWidth = Math.min(targetWidth, MAX_WIDTH);
-    targetHeight = Math.min(targetHeight, MAX_HEIGHT);
+    const scale = Math.min(MAX_WIDTH / rawWidth, MAX_HEIGHT / rawHeight, 1);
+    const targetWidth = Math.round(rawWidth * scale);
+    const targetHeight = Math.round(rawHeight * scale);
 
     canvas.width = targetWidth;
     canvas.height = targetHeight;
@@ -246,21 +244,22 @@ export default function InventoryPage() {
       ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
 
       // %50 JPEG kalitesi ile sıkıştırma: payload maksimum 100-200 KB seviyesindedir
-      let base64Image = canvas.toDataURL("image/jpeg", 0.5);
+      let compressedBase64 = canvas.toDataURL("image/jpeg", 0.5);
 
       // Güvenlik eşiği: Eğer base64 verisi hâlâ 200 KB'ı aşıyorsa ek sıkıştırma uygula
-      if (base64Image.length > 200 * 1024) {
-        base64Image = canvas.toDataURL("image/jpeg", 0.35);
+      if (compressedBase64.length > 200 * 1024) {
+        compressedBase64 = canvas.toDataURL("image/jpeg", 0.35);
       }
 
-      console.log(`Fotoğraf sıkıştırıldı: ${targetWidth}x${targetHeight}, Boyut: ~${Math.round(base64Image.length / 1024)} KB`);
+      console.log(`Fotoğraf sıkıştırıldı: ${targetWidth}x${targetHeight}, Boyut: ~${Math.round(compressedBase64.length / 1024)} KB`);
 
       // Kamera donanımını kapat ve form durumuna geç
       stopCamera();
-      setCapturedImage(base64Image);
+      setCapturedImage(compressedBase64);
 
+      // Server Action'a sadece bu sıkıştırılmış Base64 dizgesini gönder
       startTransition(() => {
-        runAiVisionProcessing(base64Image);
+        runAiVisionProcessing(compressedBase64);
       });
     }
   };
@@ -301,16 +300,11 @@ export default function InventoryPage() {
         const img = new window.Image();
         img.onload = () => {
           const canvas = canvasRef.current || document.createElement("canvas");
-          let targetWidth = img.width;
-          let targetHeight = img.height;
           const MAX_WIDTH = 640;
           const MAX_HEIGHT = 480;
-
-          if (targetWidth > MAX_WIDTH || targetHeight > MAX_HEIGHT) {
-            const ratio = Math.min(MAX_WIDTH / targetWidth, MAX_HEIGHT / targetHeight);
-            targetWidth = Math.round(targetWidth * ratio);
-            targetHeight = Math.round(targetHeight * ratio);
-          }
+          const scale = Math.min(MAX_WIDTH / img.width, MAX_HEIGHT / img.height, 1);
+          const targetWidth = Math.round(img.width * scale);
+          const targetHeight = Math.round(img.height * scale);
 
           canvas.width = targetWidth;
           canvas.height = targetHeight;
@@ -351,7 +345,7 @@ export default function InventoryPage() {
     setAiDetected(false);
     setAiErrorNotice(null);
     setSaveError(null);
-    setFormData({ brand: "", productName: "", stockQuantity: "" });
+    setFormData({ brand: "", productName: "", barcode: "", stockQuantity: "" });
     setCurrentState("camera");
   };
 
@@ -370,6 +364,7 @@ export default function InventoryPage() {
       const res = await saveToSheets(
         formData.brand || "Bilinmiyor",
         formData.productName || "İsimsiz Ürün",
+        formData.barcode || "",
         validStock
       );
 
@@ -381,7 +376,7 @@ export default function InventoryPage() {
         setCapturedImage(null);
         setAiDetected(false);
         setAiErrorNotice(null);
-        setFormData({ brand: "", productName: "", stockQuantity: "" });
+        setFormData({ brand: "", productName: "", barcode: "", stockQuantity: "" });
 
         // Return directly to Camera State ready for the next item
         setTimeout(() => {
@@ -473,10 +468,10 @@ export default function InventoryPage() {
           </div>
 
           <h2 className="text-xl font-bold font-mono tracking-wide text-zinc-100 mb-2">
-            Etiket Okunuyor...
+            Etiket ve Barkod Okunuyor...
           </h2>
           <p className="text-xs text-zinc-400 max-w-xs leading-relaxed font-mono">
-            Hırdavat ürününün marka ve modeli yapay zeka tarafından analiz ediliyor.
+            Hırdavat ürününün marka, model ve barkod bilgileri yapay zeka tarafından analiz ediliyor.
           </p>
         </div>
       )}
@@ -633,7 +628,7 @@ export default function InventoryPage() {
       )}
 
       {/* =========================================================================
-          STATE 2: FORM STATE (Inputs: Marka, Ürün Adı, Massive Stok Miktarı + Sheets Save)
+          STATE 2: FORM STATE (Inputs: Marka, Ürün Adı, Barkod, Massive Stok Miktarı + Sheets Save)
           ========================================================================= */}
       {currentState === "form" && (
         <div className="relative w-full h-full flex flex-col bg-black overflow-y-auto">
@@ -809,7 +804,53 @@ export default function InventoryPage() {
                 </div>
               </div>
 
-              {/* Input 3: Stok Miktarı (MASSIVE, Auto-focus, Numeric Keypad) */}
+              {/* Input 3: Barkod (İsteğe Bağlı - populated by Gemini AI, editable) */}
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center justify-between px-1">
+                  <label
+                    htmlFor="barcode"
+                    className="text-xs font-mono font-bold tracking-wider text-zinc-400 uppercase flex items-center gap-1.5"
+                  >
+                    <Barcode className="w-3.5 h-3.5 text-zinc-400" />
+                    Barkod (İsteğe Bağlı)
+                  </label>
+                  {aiDetected && formData.barcode && (
+                    <span className="text-[10px] font-mono text-amber-400/80">
+                      Yapay Zeka Okudu (Düzenlenebilir)
+                    </span>
+                  )}
+                </div>
+                <div className="relative">
+                  <input
+                    id="barcode"
+                    type="text"
+                    value={formData.barcode}
+                    disabled={isSaving}
+                    onChange={(e) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        barcode: e.target.value,
+                      }))
+                    }
+                    placeholder="Örn: 8690000000000 (Yoksa boş bırakılabilir)"
+                    autoComplete="off"
+                    className="w-full h-14 px-4 rounded-xl bg-zinc-900/90 border border-zinc-800 focus:border-amber-400 focus:bg-zinc-900 text-zinc-100 placeholder:text-zinc-600 text-base font-mono outline-none transition-all shadow-inner disabled:opacity-60"
+                  />
+                  {formData.barcode && !isSaving && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setFormData((prev) => ({ ...prev, barcode: "" }))
+                      }
+                      className="absolute right-3.5 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-zinc-500 hover:text-zinc-300 active:scale-90"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Input 4: Stok Miktarı (MASSIVE, Auto-focus, Numeric Keypad) */}
               <div className="flex flex-col gap-2 mt-1">
                 <div className="flex items-center justify-between px-1">
                   <label

@@ -11,9 +11,9 @@ export async function processImage(base64Image: string) {
 
     // Frontend'den gelen base64 başlığını temizle
     const base64Data = base64Image.replace(/^data:image\/\w+;base64,/, '');
-    const prompt = 'Sen bir hırdavat depo asistanısın. Bu fotoğraftaki hırdavat ürününün etiketini oku. Bana sadece JSON formatında şu iki bilgiyi dön: {"marka": "Üretici veya marka adı", "urunAdi": "Ürünün tam modeli, çeşidi ve özellikleri"}. Başka hiçbir metin yazma.';
+    const prompt = 'Sen bir hırdavat depo asistanısın. Bu fotoğraftaki hırdavat ürününün etiketini ve varsa barkodunu oku. Bana sadece JSON formatında şu üç bilgiyi dön: {"marka": "...", "urunAdi": "...", "barkod": "Resimde okunabilir bir barkod numarası varsa buraya yaz, yoksa boş bırak"}';
 
-    // Beta olan interactions yerine, kararlı olan models.generateContent kullanıyoruz
+    // Kararlı olan models.generateContent kullanıyoruz
     const response = await client.models.generateContent({
         model: "gemini-3.8-flash",
         contents: [
