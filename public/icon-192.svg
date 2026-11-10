@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="108" fill="#09090b"/>
+  <rect x="24" y="24" width="464" height="464" rx="84" fill="none" stroke="#27272a" stroke-width="8"/>
+  <!-- Gold Hexagon / Hardware Box Symbol -->
+  <path d="M256 96 L416 188 L416 372 L256 464 L96 372 L96 188 Z" fill="none" stroke="#D4AF37" stroke-width="20" stroke-linejoin="round"/>
+  <path d="M256 96 L256 464" fill="none" stroke="#D4AF37" stroke-width="16" stroke-linecap="round"/>
+  <path d="M96 188 L256 280 L416 188" fill="none" stroke="#D4AF37" stroke-width="16" stroke-linejoin="round"/>
+  <!-- Inner Subtle Accent Core -->
+  <circle cx="256" cy="280" r="16" fill="#F59E0B"/>
+</svg>
