@@ -31,6 +31,44 @@ interface FormData {
   stockQuantity: string;
 }
 
+// Kamera görüntüsünü veya video akışını yakaladığında şu sıkıştırma fonksiyonunu çalıştır:
+const compressImage = (imageSrc: string): Promise<string> => {
+  return new Promise((resolve) => {
+    const img = new window.Image();
+    img.src = imageSrc;
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let width = img.width;
+      let height = img.height;
+      
+      // Maksimum boyutları 640x480 piksele sabitle
+      const MAX_WIDTH = 640;
+      const MAX_HEIGHT = 480;
+      
+      if (width > height) {
+        if (width > MAX_WIDTH) {
+          height *= MAX_WIDTH / width;
+          width = MAX_WIDTH;
+        }
+      } else {
+        if (height > MAX_HEIGHT) {
+          width *= MAX_HEIGHT / height;
+          height = MAX_HEIGHT;
+        }
+      }
+      
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx?.drawImage(img, 0, 0, width, height);
+      
+      // Kaliteyi %50'ye düşürerek ham veriyi 100 KB altına indir
+      const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.5);
+      resolve(compressedDataUrl);
+    };
+  });
+};
+
 export default function InventoryPage() {
   const [mounted, setMounted] = useState(false);
   const [currentState, setCurrentState] = useState<AppState>("camera");
@@ -209,9 +247,8 @@ export default function InventoryPage() {
   };
 
   // 'FOTOĞRAF ÇEK' BUTONU ONCLICK FONKSİYONU:
-  // Görüntüyü canvas üzerinde maksimum 640x480 piksele küçültür (scale down)
-  // ve canvas.toDataURL('image/jpeg', 0.5) ile %50 sıkıştırarak sunucu payload'unu 100-200 KB seviyesinde tutar.
-  const capturePhoto = () => {
+  // Video akışından görüntüyü yakalar, compressImage ile sıkıştırır ve processImage'e gönderir.
+  const capturePhoto = async () => {
     const video = videoRef.current;
     if (!video) return;
 
@@ -219,49 +256,31 @@ export default function InventoryPage() {
     setShutterEffect(true);
     setTimeout(() => setShutterEffect(false), 150);
 
-    // Yeni ve temiz bir canvas oluştur (garantili boyut ve bellek optimizasyonu)
-    const canvas = document.createElement("canvas");
+    // Video akışından ham görüntüyü bir canvas üzerine aktar
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = video.videoWidth || 640;
+    tempCanvas.height = video.videoHeight || 480;
+    const ctx = tempCanvas.getContext("2d");
+    if (!ctx) return;
 
-    const rawWidth = video.videoWidth || 640;
-    const rawHeight = video.videoHeight || 480;
-
-    // Maksimum 640x480 piksele ölçekleme (Scale Down - aspect ratio korunarak)
-    const MAX_WIDTH = 640;
-    const MAX_HEIGHT = 480;
-    const scale = Math.min(MAX_WIDTH / rawWidth, MAX_HEIGHT / rawHeight, 1);
-    const targetWidth = Math.round(rawWidth * scale);
-    const targetHeight = Math.round(rawHeight * scale);
-
-    canvas.width = targetWidth;
-    canvas.height = targetHeight;
-
-    const ctx = canvas.getContext("2d");
-    if (ctx) {
-      if (facingMode === "user") {
-        ctx.translate(targetWidth, 0);
-        ctx.scale(-1, 1);
-      }
-      ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
-
-      // %50 JPEG kalitesi ile sıkıştırma: payload maksimum 100-200 KB seviyesindedir
-      let compressedBase64 = canvas.toDataURL("image/jpeg", 0.5);
-
-      // Güvenlik eşiği: Eğer base64 verisi hâlâ 200 KB'ı aşıyorsa ek sıkıştırma uygula
-      if (compressedBase64.length > 200 * 1024) {
-        compressedBase64 = canvas.toDataURL("image/jpeg", 0.35);
-      }
-
-      console.log(`Fotoğraf sıkıştırıldı: ${targetWidth}x${targetHeight}, Boyut: ~${Math.round(compressedBase64.length / 1024)} KB`);
-
-      // Kamera donanımını kapat ve form durumuna geç
-      stopCamera();
-      setCapturedImage(compressedBase64);
-
-      // Server Action'a sadece bu sıkıştırılmış Base64 dizgesini gönder
-      startTransition(() => {
-        runAiVisionProcessing(compressedBase64);
-      });
+    if (facingMode === "user") {
+      ctx.translate(tempCanvas.width, 0);
+      ctx.scale(-1, 1);
     }
+    ctx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
+    const rawImageSrc = tempCanvas.toDataURL("image/jpeg", 0.95);
+
+    // İstemci tarafında kesin sıkıştırma fonksiyonunu çalıştır (maksimum 640x480, %50 JPEG kalitesi)
+    const compressedImage = await compressImage(rawImageSrc);
+
+    // Kamera donanımını kapat ve önizlemeyi kaydet
+    stopCamera();
+    setCapturedImage(compressedImage);
+
+    // Dönen sıkıştırılmış base64 string Server Action'a (processImage) verilsin
+    startTransition(() => {
+      runAiVisionProcessing(compressedImage);
+    });
   };
 
   // Toggle flashlight / torch
@@ -288,44 +307,21 @@ export default function InventoryPage() {
     setFacingMode((prev) => (prev === "environment" ? "user" : "environment"));
   };
 
-  // Fallback: File upload when camera is unavailable (with 640x480 & 0.5 compression)
+  // Fallback: File upload when camera is unavailable (sıkıştırma köprüsünü çalıştırır)
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       const result = event.target?.result as string;
       if (result) {
-        const img = new window.Image();
-        img.onload = () => {
-          const canvas = canvasRef.current || document.createElement("canvas");
-          const MAX_WIDTH = 640;
-          const MAX_HEIGHT = 480;
-          const scale = Math.min(MAX_WIDTH / img.width, MAX_HEIGHT / img.height, 1);
-          const targetWidth = Math.round(img.width * scale);
-          const targetHeight = Math.round(img.height * scale);
-
-          canvas.width = targetWidth;
-          canvas.height = targetHeight;
-          const ctx = canvas.getContext("2d");
-          if (ctx) {
-            ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
-            const compressed = canvas.toDataURL("image/jpeg", 0.5);
-            stopCamera();
-            setCapturedImage(compressed);
-            startTransition(() => {
-              runAiVisionProcessing(compressed);
-            });
-          } else {
-            stopCamera();
-            setCapturedImage(result);
-            startTransition(() => {
-              runAiVisionProcessing(result);
-            });
-          }
-        };
-        img.src = result;
+        const compressed = await compressImage(result);
+        stopCamera();
+        setCapturedImage(compressed);
+        startTransition(() => {
+          runAiVisionProcessing(compressed);
+        });
       }
     };
     reader.readAsDataURL(file);
