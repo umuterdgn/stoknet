@@ -85,6 +85,7 @@ export default function InventoryPage() {
   // AI & Processing state
   const [isAiProcessing, setIsAiProcessing] = useState(false);
   const [aiErrorNotice, setAiErrorNotice] = useState<string | null>(null);
+  const [aiErrorType, setAiErrorType] = useState<"timeout" | "api" | null>(null);
   const [aiDetected, setAiDetected] = useState(false);
   const [, startTransition] = useTransition();
 
@@ -198,15 +199,39 @@ export default function InventoryPage() {
     }
   }, [currentState]);
 
-  // Process image with Gemini Vision via Server Action
-  const runAiVisionProcessing = async (base64Image: string) => {
+  // Process image with Gemini Vision via Server Action (15s kontrollü timeout, unique requestId, performance measurement)
+  const runAiVisionProcessing = async (base64Image: string, requestId: string) => {
     setIsAiProcessing(true);
     setAiErrorNotice(null);
+    setAiErrorType(null);
     setAiDetected(false);
     setSaveError(null);
 
+    const startTime = performance.now();
+    console.log(`[RequestID: ${requestId}] Frontend: İstek başlatıldı (15s zaman aşımı kontrolü). Boyut: ~${Math.round(base64Image.length / 1024)} KB`);
+
+    let timerId: ReturnType<typeof setTimeout> | undefined;
+
     try {
-      const result = await processImage(base64Image);
+      // Kontrollü Timeout: Server Action çağrısını (processImage) maksimum 15 saniyeyle sınırla
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timerId = setTimeout(() => {
+          const timeoutErr = new Error("ZAMAN_ASIMI");
+          timeoutErr.name = "TimeoutError";
+          reject(timeoutErr);
+        }, 15000);
+      });
+
+      // Fail-Fast: API çağrısı için while veya retry döngüsü yok, tekil istek
+      const result = await Promise.race([
+        processImage(base64Image, requestId),
+        timeoutPromise,
+      ]);
+
+      if (timerId) clearTimeout(timerId);
+
+      const duration = Math.round(performance.now() - startTime);
+      console.log(`[RequestID: ${requestId}] Gerçek işleme süresi: ${duration} ms`);
 
       const brand = typeof result?.marka === "string" ? result.marka.trim() : "";
       const product = typeof result?.urunAdi === "string" ? result.urunAdi.trim() : "";
@@ -229,11 +254,31 @@ export default function InventoryPage() {
         });
       }
     } catch (err: any) {
-      console.error("AI Vision invocation error:", err);
-      const cleanMsg =
-        err?.message ||
-        "Görüntü analiz edilirken bir hata oluştu. Bilgileri manuel olarak doldurabilirsiniz.";
-      setAiErrorNotice(cleanMsg);
+      if (timerId) clearTimeout(timerId);
+
+      const duration = Math.round(performance.now() - startTime);
+      console.log(`[RequestID: ${requestId}] Gerçek işleme süresi: ${duration} ms`);
+
+      // Hata Ayrıştırması: 'Zaman Aşımı (Timeout)' mu yoksa 'Google API / Sunucu Hatası' mı?
+      const isTimeout =
+        err?.name === "TimeoutError" ||
+        err?.message === "ZAMAN_ASIMI" ||
+        err?.message?.toLowerCase().includes("timeout") ||
+        err?.message?.toLowerCase().includes("zaman aşımı");
+
+      if (isTimeout) {
+        setAiErrorType("timeout");
+        setAiErrorNotice(
+          "İstek 15 saniye içinde tamamlanamadı ve zaman aşımına uğradı. Sunucu veya internet bağlantısı geç yanıt verdi. 'Yeniden Çek' butonuyla tekrar deneyebilir veya bilgileri elle doldurabilirsiniz."
+        );
+      } else {
+        setAiErrorType("api");
+        const detailMsg = err?.message || "Google API yanıt vermedi veya geçersiz yanıt döndü.";
+        setAiErrorNotice(
+          `Google API / Sunucu Hatası: ${detailMsg}. Bilgileri elle doldurabilir veya 'Yeniden Çek' butonu ile yeni fotoğraf deneyebilirsiniz.`
+        );
+      }
+
       setFormData({
         brand: "",
         productName: "",
@@ -247,7 +292,7 @@ export default function InventoryPage() {
   };
 
   // 'FOTOĞRAF ÇEK' BUTONU ONCLICK FONKSİYONU:
-  // Video akışından görüntüyü yakalar, compressImage ile sıkıştırır ve processImage'e gönderir.
+  // Benzersiz RequestID üretir, video karesini alır, compressImage ile sıkıştırır ve processImage'e gönderir.
   const capturePhoto = async () => {
     const video = videoRef.current;
     if (!video) return;
@@ -255,6 +300,12 @@ export default function InventoryPage() {
     // Deklanşör flaş animasyonu
     setShutterEffect(true);
     setTimeout(() => setShutterEffect(false), 150);
+
+    // Her işlemde benzersiz Request ID (crypto.randomUUID)
+    const requestId =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
     // Video akışından ham görüntüyü bir canvas üzerine aktar
     const tempCanvas = document.createElement("canvas");
@@ -277,9 +328,9 @@ export default function InventoryPage() {
     stopCamera();
     setCapturedImage(compressedImage);
 
-    // Dönen sıkıştırılmış base64 string Server Action'a (processImage) verilsin
+    // Dönen sıkıştırılmış base64 string ve Request ID Server Action'a verilsin
     startTransition(() => {
-      runAiVisionProcessing(compressedImage);
+      runAiVisionProcessing(compressedImage, requestId);
     });
   };
 
@@ -316,11 +367,16 @@ export default function InventoryPage() {
     reader.onload = async (event) => {
       const result = event.target?.result as string;
       if (result) {
+        const requestId =
+          typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+            ? crypto.randomUUID()
+            : `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
         const compressed = await compressImage(result);
         stopCamera();
         setCapturedImage(compressed);
         startTransition(() => {
-          runAiVisionProcessing(compressed);
+          runAiVisionProcessing(compressed, requestId);
         });
       }
     };
@@ -340,6 +396,7 @@ export default function InventoryPage() {
     setCapturedImage(null);
     setAiDetected(false);
     setAiErrorNotice(null);
+    setAiErrorType(null);
     setSaveError(null);
     setFormData({ brand: "", productName: "", barcode: "", stockQuantity: "" });
     setCurrentState("camera");
@@ -372,6 +429,7 @@ export default function InventoryPage() {
         setCapturedImage(null);
         setAiDetected(false);
         setAiErrorNotice(null);
+        setAiErrorType(null);
         setFormData({ brand: "", productName: "", barcode: "", stockQuantity: "" });
 
         // Return directly to Camera State ready for the next item
@@ -690,13 +748,29 @@ export default function InventoryPage() {
                 </div>
               )}
 
-              {/* AI Warning / Error notice */}
+              {/* AI Warning / Error notice: Hata Ayrıştırması (Timeout vs Google API / Sunucu Hatası) */}
               {aiErrorNotice && (
-                <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex items-start gap-2.5 animate-in fade-in duration-200">
-                  <AlertCircle className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" />
+                <div
+                  className={`p-3.5 rounded-2xl border text-xs flex items-start gap-2.5 animate-in fade-in duration-200 ${
+                    aiErrorType === "timeout"
+                      ? "bg-amber-500/10 border-amber-500/35 text-amber-200"
+                      : "bg-red-500/15 border-red-500/40 text-red-200"
+                  }`}
+                >
+                  <AlertCircle
+                    className={`w-4 h-4 shrink-0 mt-0.5 ${
+                      aiErrorType === "timeout" ? "text-amber-400" : "text-red-400"
+                    }`}
+                  />
                   <div className="flex-1">
-                    <div className="font-mono font-bold text-amber-300 mb-0.5">
-                      Yapay Zeka Etiket Okuma Bildirimi
+                    <div
+                      className={`font-mono font-bold mb-0.5 ${
+                        aiErrorType === "timeout" ? "text-amber-300" : "text-red-300"
+                      }`}
+                    >
+                      {aiErrorType === "timeout"
+                        ? "⏱ İstek Zaman Aşımı (15s)"
+                        : "⚠️ Google API / Sunucu Hatası"}
                     </div>
                     <div className="font-mono text-[11px] leading-relaxed text-zinc-300">
                       {aiErrorNotice}
