@@ -212,8 +212,8 @@ export default function InventoryPage() {
     setShutterEffect(true);
     setTimeout(() => setShutterEffect(false), 150);
 
-    const canvas = canvasRef.current || document.createElement("canvas");
-    canvasRef.current = canvas;
+    // Yeni ve temiz bir canvas oluştur (garantili boyut ve bellek optimizasyonu)
+    const canvas = document.createElement("canvas");
 
     const rawWidth = video.videoWidth || 640;
     const rawHeight = video.videoHeight || 480;
@@ -230,6 +230,10 @@ export default function InventoryPage() {
       targetHeight = Math.round(targetHeight * ratio);
     }
 
+    // Kesin sınır kontrolü
+    targetWidth = Math.min(targetWidth, MAX_WIDTH);
+    targetHeight = Math.min(targetHeight, MAX_HEIGHT);
+
     canvas.width = targetWidth;
     canvas.height = targetHeight;
 
@@ -242,7 +246,14 @@ export default function InventoryPage() {
       ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
 
       // %50 JPEG kalitesi ile sıkıştırma: payload maksimum 100-200 KB seviyesindedir
-      const base64Image = canvas.toDataURL("image/jpeg", 0.5);
+      let base64Image = canvas.toDataURL("image/jpeg", 0.5);
+
+      // Güvenlik eşiği: Eğer base64 verisi hâlâ 200 KB'ı aşıyorsa ek sıkıştırma uygula
+      if (base64Image.length > 200 * 1024) {
+        base64Image = canvas.toDataURL("image/jpeg", 0.35);
+      }
+
+      console.log(`Fotoğraf sıkıştırıldı: ${targetWidth}x${targetHeight}, Boyut: ~${Math.round(base64Image.length / 1024)} KB`);
 
       // Kamera donanımını kapat ve form durumuna geç
       stopCamera();
