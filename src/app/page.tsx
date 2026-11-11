@@ -162,6 +162,7 @@ export default function InventoryPage() {
   });
   const [batchCurrentImage, setBatchCurrentImage] = useState<string | null>(null);
   const [batchWaitingCooldown, setBatchWaitingCooldown] = useState(false);
+  const [batchStatusText, setBatchStatusText] = useState<string>("");
   const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
   const [batchErrorLogs, setBatchErrorLogs] = useState<string[]>([]);
   const [isBatchSavingAll, setIsBatchSavingAll] = useState(false);
@@ -448,9 +449,9 @@ export default function InventoryPage() {
     });
   };
 
-  // TOPLU İŞLEM (BATCH PROCESSING) KUYRUK MANTIĞI:
-  // Seçilen dosyaları aynı anda sunucuya fırlatmaz; for...of döngüsü ile sırayla sıkıştırıp gönderir,
-  // aralarında 3 saniye bekler ve 503 / Timeout hatalarını döngüyü kırmadan atlatır.
+  // TOPLU İŞLEM (BATCH PROCESSING) - ASLA PES ETMEYEN (INFINITE RETRY) MANTIĞI:
+  // Zaman aşımı yok; 503/yoğunluk hatalarında fotoğrafı asla atlamaz.
+  // 5 saniye bekleyip aynı fotoğrafı yeniden dener, Google Sheets'e kaydedilince sıradakine geçer.
   const handleBatchUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
     e.target.value = "";
@@ -463,6 +464,7 @@ export default function InventoryPage() {
     setBatchItems([]);
     setBatchErrorLogs([]);
     setBatchWaitingCooldown(false);
+    setBatchStatusText("Durum: Kuyruk başlatılıyor...");
     setBatchCurrentImage(null);
     setBatchProgress({ current: 0, total: files.length });
 
@@ -470,102 +472,123 @@ export default function InventoryPage() {
 
     for (const file of files) {
       if (batchCancelRef.current) {
-        setBatchErrorLogs((prev) => [
-          ...prev,
-          `Toplu işlem kullanıcı tarafından ${index} / ${files.length} aşamasında durduruldu.`,
-        ]);
+        setBatchStatusText(`Durum: İşlem kullanıcı tarafından durduruldu.`);
         break;
       }
 
       index += 1;
       setBatchProgress({ current: index, total: files.length });
 
-      const requestId = generateRequestId();
-      const startTime = performance.now();
-
+      // 1. Resmi oku ve mevcut compressImage fonksiyonu ile sıkıştır (640x480, %50 JPEG)
+      let compressedBase64 = "";
       try {
-        // 1. Resmi oku ve mevcut compressImage fonksiyonu ile sıkıştır (640x480, %50 JPEG)
+        setBatchStatusText(`Durum: "${file.name}" sıkıştırılıyor...`);
         const rawDataUrl = await readFileAsDataURL(file);
-        const compressedBase64 = await compressImage(rawDataUrl);
+        compressedBase64 = await compressImage(rawDataUrl);
         setBatchCurrentImage(compressedBase64);
-
-        console.log(
-          `[RequestID: ${requestId}] Batch (${index}/${files.length}): "${file.name}" sıkıştırıldı (~${Math.round(compressedBase64.length / 1024)} KB), gönderiliyor...`
-        );
-
-        // 2. 15s Kontrollü Timeout ile processImage (Server Action) çağır
-        const result = await processImageWithTimeout(compressedBase64, requestId);
-
-        const duration = Math.round(performance.now() - startTime);
-        console.log(
-          `[RequestID: ${requestId}] Gerçek işleme süresi: ${duration} ms (Batch ${index}/${files.length})`
-        );
-
-        const brand = typeof result?.marka === "string" ? result.marka.trim() : "";
-        const product = typeof result?.urunAdi === "string" ? result.urunAdi.trim() : "";
-        const barcode = typeof result?.barkod === "string" ? result.barkod.trim() : "";
-
-        setBatchItems((prev) => [
-          ...prev,
-          {
-            id: requestId,
-            fileName: file.name,
-            thumbnail: compressedBase64,
-            marka: brand || "Bilinmiyor",
-            urunAdi: product || "",
-            barkod: barcode || "",
-            stok: "1",
-            status: "success",
-            saved: false,
-          },
-        ]);
-      } catch (err: any) {
-        // Hata Atlatma (Fault Tolerance): 503 veya Timeout olsa bile döngü KIRILMASIN
-        const duration = Math.round(performance.now() - startTime);
-        const errMsg = err?.message || "Google API / Sunucu hatası";
-        const is503 =
-          errMsg.includes("503") ||
-          errMsg.toLowerCase().includes("high demand") ||
-          errMsg.toLowerCase().includes("unavailable");
-        const isTimeout =
-          err?.name === "TimeoutError" ||
-          errMsg.includes("ZAMAN_ASIMI") ||
-          errMsg.toLowerCase().includes("timeout");
-
-        const reasonText = is503
-          ? `503 High Demand (${errMsg})`
-          : isTimeout
-            ? "Zaman Aşımı (15s)"
-            : errMsg;
-
-        console.error(
-          `[RequestID: ${requestId}] Batch (${index}/${files.length}) HATA - Es geçiliyor (${duration} ms): ${file.name} -> ${reasonText}`
-        );
-
+      } catch (fileErr: any) {
+        console.error(`Dosya okuma/sıkıştırma hatası [${file.name}]:`, fileErr);
         setBatchErrorLogs((prev) => [
           ...prev,
-          `#${index} [${file.name}]: ${reasonText}`,
+          `#${index} [${file.name}]: Dosya okunamadı/bozuk (${fileErr?.message || "hata"})`,
         ]);
-
-        setBatchItems((prev) => [
-          ...prev,
-          {
-            id: requestId,
-            fileName: file.name,
-            thumbnail: "",
-            marka: "",
-            urunAdi: "",
-            barkod: "",
-            stok: "0",
-            status: "error",
-            errorMessage: reasonText,
-            saved: false,
-          },
-        ]);
+        continue;
       }
 
-      // 3. Google API limitlerine takılmamak için istekten sonra 3 saniye bekle
-      if (!batchCancelRef.current && index < files.length) {
+      let success = false;
+      let attempt = 0;
+
+      // İnatçı Tekrar Döngüsü: Fotoğraf Google Sheets'e kaydedilene kadar asla pes etmez
+      while (!success) {
+        if (batchCancelRef.current) {
+          setBatchStatusText(`Durum: İşlem kullanıcı tarafından durduruldu.`);
+          break;
+        }
+
+        attempt += 1;
+        const requestId = generateRequestId();
+        const startTime = performance.now();
+
+        try {
+          setBatchStatusText(
+            attempt === 1
+              ? `Durum: "${file.name}" analiz ediliyor (zaman aşımı yok)...`
+              : `Durum: "${file.name}" yeniden deneniyor (Deneme #${attempt})...`
+          );
+
+          console.log(
+            `[RequestID: ${requestId}] Batch (${index}/${files.length}, Deneme #${attempt}): "${file.name}" (~${Math.round(compressedBase64.length / 1024)} KB) gönderiliyor (Timeout yok)...`
+          );
+
+          // Zaman Aşımını Kaldır: Promise.race veya timeout yok, istek ne kadar sürerse sürsün bekler
+          const result = await processImage(compressedBase64, requestId);
+
+          const duration = Math.round(performance.now() - startTime);
+          console.log(
+            `[RequestID: ${requestId}] Gerçek işleme süresi: ${duration} ms (Batch ${index}/${files.length}, Deneme #${attempt})`
+          );
+
+          const brand = typeof result?.marka === "string" ? result.marka.trim() : "";
+          const product = typeof result?.urunAdi === "string" ? result.urunAdi.trim() : "";
+          const barcode = typeof result?.barkod === "string" ? result.barkod.trim() : "";
+
+          // Google Sheets'e kaydet
+          setBatchStatusText(`Durum: "${brand || file.name}" Google Sheets'e kaydediliyor...`);
+          const sheetsRes = await saveToSheets(
+            brand || "Bilinmiyor",
+            product || "İsimsiz Ürün",
+            barcode || "",
+            1
+          );
+
+          if (!sheetsRes.success) {
+            throw new Error(sheetsRes.error || "Google E-Tabloya kaydedilemedi.");
+          }
+
+          // Başarı Durumu: Google Sheets'e başarıyla kaydedilince success = true yapıp döngüyü bitir
+          success = true;
+          setBatchStatusText(`Durum: "${brand || file.name}" Google Sheets'e başarıyla kaydedildi!`);
+
+          setBatchItems((prev) => [
+            ...prev,
+            {
+              id: requestId,
+              fileName: file.name,
+              thumbnail: compressedBase64,
+              marka: brand || "Bilinmiyor",
+              urunAdi: product || "",
+              barkod: barcode || "",
+              stok: "1",
+              status: "success",
+              saved: true,
+            },
+          ]);
+        } catch (err: any) {
+          // Fotoğrafı atlama (skip etme)! 5 saniye bekle ve AYNI fotoğrafı tekrar dene.
+          const duration = Math.round(performance.now() - startTime);
+          const errMsg = err?.message || "Google API / Sunucu hatası";
+
+          console.warn(
+            `[RequestID: ${requestId}] Batch (${index}/${files.length}, Deneme #${attempt}) HATA (${duration} ms): ${errMsg} -> 5sn sonra aynı fotoğraf tekrar denenecek.`
+          );
+
+          setBatchStatusText("Durum: Google sunucuları yoğun, 5 saniye sonra tekrar deneniyor...");
+          setBatchErrorLogs((prev) => [
+            ...prev.slice(-29),
+            `#${index} [${file.name} - Deneme #${attempt}]: ${errMsg} (5sn sonra tekrar)`,
+          ]);
+
+          setBatchWaitingCooldown(true);
+          await new Promise((res) => setTimeout(res, 5000));
+          setBatchWaitingCooldown(false);
+        }
+      }
+
+      if (batchCancelRef.current) break;
+
+      // Bir sonraki fotoğrafa geçmeden önce API limit koruması (3s bekleme)
+      if (index < files.length) {
+        setBatchStatusText("Durum: Sıradaki fotoğraf için 3 saniye bekleniyor...");
         setBatchWaitingCooldown(true);
         await new Promise((res) => setTimeout(res, 3000));
         setBatchWaitingCooldown(false);
@@ -575,6 +598,9 @@ export default function InventoryPage() {
     setIsBatchProcessing(false);
     setBatchWaitingCooldown(false);
     setBatchCurrentImage(null);
+    if (!batchCancelRef.current) {
+      setBatchStatusText("Durum: Tüm fotoğraflar Google Sheets'e kaydedildi!");
+    }
   };
 
   // Batch item field updater
@@ -673,6 +699,7 @@ export default function InventoryPage() {
     setIsBatchView(false);
     setIsBatchProcessing(false);
     setBatchWaitingCooldown(false);
+    setBatchStatusText("");
     setBatchCurrentImage(null);
     setCurrentState("camera");
   };
@@ -1441,20 +1468,33 @@ export default function InventoryPage() {
               <div className="flex items-center justify-between text-xs font-mono">
                 <div className="flex items-center gap-3">
                   <span className="text-emerald-400 font-bold">
-                    ✓ Başarılı: {batchItems.filter((i) => i.status === "success").length}
+                    ✓ Kaydedildi: {batchItems.filter((i) => i.saved).length}
                   </span>
-                  <span className="text-red-400 font-bold">
-                    ✕ Es Geçilen: {batchItems.filter((i) => i.status === "error").length}
+                  <span className="text-amber-300/90 font-bold">
+                    ↻ Tekrar: {batchErrorLogs.length}
                   </span>
                 </div>
 
                 {batchWaitingCooldown && (
                   <div className="flex items-center gap-1.5 text-amber-300 animate-pulse">
                     <Clock className="w-3.5 h-3.5" />
-                    <span>3sn bekleniyor...</span>
+                    <span>Bekleniyor...</span>
                   </div>
                 )}
               </div>
+
+              {/* Live Status Banner (Displays exact retry status on 503/errors) */}
+              {batchStatusText && (
+                <div
+                  className={`px-3 py-2 rounded-xl border font-mono text-xs leading-relaxed ${
+                    batchStatusText.includes("yoğun")
+                      ? "bg-amber-500/15 border-amber-500/40 text-amber-300 font-bold"
+                      : "bg-zinc-950/90 border-zinc-800 text-zinc-200"
+                  }`}
+                >
+                  {batchStatusText}
+                </div>
+              )}
 
               {/* Current Processing Thumbnail */}
               {isBatchProcessing && batchCurrentImage && (
@@ -1471,30 +1511,28 @@ export default function InventoryPage() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="text-[11px] font-mono text-amber-300 font-semibold truncate">
-                      {batchWaitingCooldown
-                        ? "Google API limit koruması: Sonraki fotoğraf için 3sn bekleniyor..."
-                        : "Etiket ve barkod okunuyor..."}
+                      {batchStatusText || "Etiket ve barkod okunuyor..."}
                     </div>
                     <div className="text-[10px] font-mono text-zinc-500">
-                      640x480 sıkıştırma aktif • Hata atlatma korumalı kuyruk
+                      640x480 sıkıştırma aktif • İnatçı tekrar (while) kuyruğu
                     </div>
                   </div>
                 </div>
               )}
             </div>
 
-            {/* Error Log Box (Fault Tolerance - Skipped Photos) */}
+            {/* Retry Log Box (Fault Tolerance - Never Skip) */}
             {batchErrorLogs.length > 0 && (
-              <div className="rounded-2xl bg-red-950/25 border border-red-500/30 p-3.5 flex flex-col gap-2">
-                <div className="flex items-center gap-2 text-xs font-mono font-bold text-red-300">
-                  <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-                  <span>Hata Logu / Es Geçilenler ({batchErrorLogs.length})</span>
+              <div className="rounded-2xl bg-amber-950/20 border border-amber-500/30 p-3.5 flex flex-col gap-2">
+                <div className="flex items-center gap-2 text-xs font-mono font-bold text-amber-300">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Tekrar Deneme Logu ({batchErrorLogs.length})</span>
                 </div>
                 <div className="max-h-28 overflow-y-auto flex flex-col gap-1 pr-1">
                   {batchErrorLogs.map((log, i) => (
                     <div
                       key={i}
-                      className="text-[11px] font-mono text-red-200/85 bg-black/40 px-2.5 py-1.5 rounded-lg border border-red-500/15"
+                      className="text-[11px] font-mono text-amber-200/85 bg-black/40 px-2.5 py-1.5 rounded-lg border border-amber-500/15"
                     >
                       {log}
                     </div>
