@@ -18,6 +18,11 @@ import {
   Loader2,
   ScanLine,
   Barcode,
+  Layers,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  ArrowLeft,
 } from "lucide-react";
 import { processImage } from "@/actions/process-image";
 import { saveToSheets } from "@/actions/save-to-sheets";
@@ -31,11 +36,23 @@ interface FormData {
   stockQuantity: string;
 }
 
+interface BatchItem {
+  id: string;
+  fileName: string;
+  thumbnail: string;
+  marka: string;
+  urunAdi: string;
+  barkod: string;
+  stok: string;
+  status: "success" | "error";
+  errorMessage?: string;
+  saved: boolean;
+}
+
 // Kamera görüntüsünü veya video akışını yakaladığında şu sıkıştırma fonksiyonunu çalıştır:
 const compressImage = (imageSrc: string): Promise<string> => {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const img = new window.Image();
-    img.src = imageSrc;
     img.onload = () => {
       const canvas = document.createElement('canvas');
       let width = img.width;
@@ -66,7 +83,42 @@ const compressImage = (imageSrc: string): Promise<string> => {
       const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.5);
       resolve(compressedDataUrl);
     };
+    img.onerror = () => {
+      reject(new Error('Görsel sıkıştırma sırasında yüklenemedi veya dosya bozuk.'));
+    };
+    img.src = imageSrc;
   });
+};
+
+// Her işlem için benzersiz Request ID üretir
+const generateRequestId = (): string =>
+  typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+// Server Action çağrısını 15s zaman aşımı ile sınırlar (Fail-Fast, tekil çağrı)
+const processImageWithTimeout = async (
+  base64Image: string,
+  requestId: string,
+  timeoutMs = 15000
+) => {
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timerId = setTimeout(() => {
+      const timeoutErr = new Error("ZAMAN_ASIMI");
+      timeoutErr.name = "TimeoutError";
+      reject(timeoutErr);
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([
+      processImage(base64Image, requestId),
+      timeoutPromise,
+    ]);
+  } finally {
+    if (timerId) clearTimeout(timerId);
+  }
 };
 
 export default function InventoryPage() {
@@ -101,12 +153,27 @@ export default function InventoryPage() {
   const [hasTorch, setHasTorch] = useState(false);
   const [shutterEffect, setShutterEffect] = useState(false);
 
+  // Batch Processing (Toplu İşlem) state
+  const [isBatchView, setIsBatchView] = useState(false);
+  const [isBatchProcessing, setIsBatchProcessing] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number }>({
+    current: 0,
+    total: 0,
+  });
+  const [batchCurrentImage, setBatchCurrentImage] = useState<string | null>(null);
+  const [batchWaitingCooldown, setBatchWaitingCooldown] = useState(false);
+  const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
+  const [batchErrorLogs, setBatchErrorLogs] = useState<string[]>([]);
+  const [isBatchSavingAll, setIsBatchSavingAll] = useState(false);
+
   // Refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const stockInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const batchFileInputRef = useRef<HTMLInputElement | null>(null);
+  const batchCancelRef = useRef(false);
 
   // Prevent SSR locking by waiting for client-side mount
   useEffect(() => {
@@ -175,7 +242,7 @@ export default function InventoryPage() {
 
   // Manage camera lifecycle based on state
   useEffect(() => {
-    if (mounted && currentState === "camera" && !isAiProcessing) {
+    if (mounted && currentState === "camera" && !isAiProcessing && !isBatchView) {
       startCamera();
     } else {
       stopCamera();
@@ -184,11 +251,11 @@ export default function InventoryPage() {
     return () => {
       stopCamera();
     };
-  }, [mounted, currentState, isAiProcessing, startCamera, stopCamera]);
+  }, [mounted, currentState, isAiProcessing, isBatchView, startCamera, stopCamera]);
 
   // Auto-focus stock quantity input immediately upon rendering Form State (Safe: no setState)
   useEffect(() => {
-    if (currentState === "form") {
+    if (currentState === "form" && !isBatchView) {
       const timer = setTimeout(() => {
         if (stockInputRef.current) {
           stockInputRef.current.focus();
@@ -197,7 +264,7 @@ export default function InventoryPage() {
       }, 150);
       return () => clearTimeout(timer);
     }
-  }, [currentState]);
+  }, [currentState, isBatchView]);
 
   // Process image with Gemini Vision via Server Action (15s kontrollü timeout, unique requestId, performance measurement)
   const runAiVisionProcessing = async (base64Image: string, requestId: string) => {
@@ -210,25 +277,9 @@ export default function InventoryPage() {
     const startTime = performance.now();
     console.log(`[RequestID: ${requestId}] Frontend: İstek başlatıldı (15s zaman aşımı kontrolü). Boyut: ~${Math.round(base64Image.length / 1024)} KB`);
 
-    let timerId: ReturnType<typeof setTimeout> | undefined;
-
     try {
-      // Kontrollü Timeout: Server Action çağrısını (processImage) maksimum 15 saniyeyle sınırla
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timerId = setTimeout(() => {
-          const timeoutErr = new Error("ZAMAN_ASIMI");
-          timeoutErr.name = "TimeoutError";
-          reject(timeoutErr);
-        }, 15000);
-      });
-
-      // Fail-Fast: API çağrısı için while veya retry döngüsü yok, tekil istek
-      const result = await Promise.race([
-        processImage(base64Image, requestId),
-        timeoutPromise,
-      ]);
-
-      if (timerId) clearTimeout(timerId);
+      // Fail-Fast + 15s Timeout: API çağrısı için while veya retry döngüsü yok, tekil istek
+      const result = await processImageWithTimeout(base64Image, requestId);
 
       const duration = Math.round(performance.now() - startTime);
       console.log(`[RequestID: ${requestId}] Gerçek işleme süresi: ${duration} ms`);
@@ -254,8 +305,6 @@ export default function InventoryPage() {
         });
       }
     } catch (err: any) {
-      if (timerId) clearTimeout(timerId);
-
       const duration = Math.round(performance.now() - startTime);
       console.log(`[RequestID: ${requestId}] Gerçek işleme süresi: ${duration} ms`);
 
@@ -302,10 +351,7 @@ export default function InventoryPage() {
     setTimeout(() => setShutterEffect(false), 150);
 
     // Her işlemde benzersiz Request ID (crypto.randomUUID)
-    const requestId =
-      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-        ? crypto.randomUUID()
-        : `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const requestId = generateRequestId();
 
     // Video akışından ham görüntüyü bir canvas üzerine aktar
     const tempCanvas = document.createElement("canvas");
@@ -322,7 +368,12 @@ export default function InventoryPage() {
     const rawImageSrc = tempCanvas.toDataURL("image/jpeg", 0.95);
 
     // İstemci tarafında kesin sıkıştırma fonksiyonunu çalıştır (maksimum 640x480, %50 JPEG kalitesi)
-    const compressedImage = await compressImage(rawImageSrc);
+    let compressedImage = rawImageSrc;
+    try {
+      compressedImage = await compressImage(rawImageSrc);
+    } catch (err) {
+      console.warn("Kamera görüntüsü sıkıştırma uyarısı, ham veri ile devam ediliyor:", err);
+    }
 
     // Kamera donanımını kapat ve önizlemeyi kaydet
     stopCamera();
@@ -367,20 +418,263 @@ export default function InventoryPage() {
     reader.onload = async (event) => {
       const result = event.target?.result as string;
       if (result) {
-        const requestId =
-          typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-            ? crypto.randomUUID()
-            : `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const requestId = generateRequestId();
 
-        const compressed = await compressImage(result);
-        stopCamera();
-        setCapturedImage(compressed);
-        startTransition(() => {
-          runAiVisionProcessing(compressed, requestId);
-        });
+        try {
+          const compressed = await compressImage(result);
+          stopCamera();
+          setCapturedImage(compressed);
+          startTransition(() => {
+            runAiVisionProcessing(compressed, requestId);
+          });
+        } catch (err) {
+          console.error("Dosya sıkıştırma hatası:", err);
+          setAiErrorType("api");
+          setAiErrorNotice("Seçilen görsel işlenemedi veya dosya bozuk.");
+          setCurrentState("form");
+        }
       }
     };
     reader.readAsDataURL(file);
+  };
+
+  // Helper: Dosyayı Base64 DataURL formatında oku
+  const readFileAsDataURL = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(new Error(`Dosya okunamadı: ${file.name}`));
+      reader.readAsDataURL(file);
+    });
+  };
+
+  // TOPLU İŞLEM (BATCH PROCESSING) KUYRUK MANTIĞI:
+  // Seçilen dosyaları aynı anda sunucuya fırlatmaz; for...of döngüsü ile sırayla sıkıştırıp gönderir,
+  // aralarında 3 saniye bekler ve 503 / Timeout hatalarını döngüyü kırmadan atlatır.
+  const handleBatchUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = "";
+    if (files.length === 0) return;
+
+    stopCamera();
+    batchCancelRef.current = false;
+    setIsBatchView(true);
+    setIsBatchProcessing(true);
+    setBatchItems([]);
+    setBatchErrorLogs([]);
+    setBatchWaitingCooldown(false);
+    setBatchCurrentImage(null);
+    setBatchProgress({ current: 0, total: files.length });
+
+    let index = 0;
+
+    for (const file of files) {
+      if (batchCancelRef.current) {
+        setBatchErrorLogs((prev) => [
+          ...prev,
+          `Toplu işlem kullanıcı tarafından ${index} / ${files.length} aşamasında durduruldu.`,
+        ]);
+        break;
+      }
+
+      index += 1;
+      setBatchProgress({ current: index, total: files.length });
+
+      const requestId = generateRequestId();
+      const startTime = performance.now();
+
+      try {
+        // 1. Resmi oku ve mevcut compressImage fonksiyonu ile sıkıştır (640x480, %50 JPEG)
+        const rawDataUrl = await readFileAsDataURL(file);
+        const compressedBase64 = await compressImage(rawDataUrl);
+        setBatchCurrentImage(compressedBase64);
+
+        console.log(
+          `[RequestID: ${requestId}] Batch (${index}/${files.length}): "${file.name}" sıkıştırıldı (~${Math.round(compressedBase64.length / 1024)} KB), gönderiliyor...`
+        );
+
+        // 2. 15s Kontrollü Timeout ile processImage (Server Action) çağır
+        const result = await processImageWithTimeout(compressedBase64, requestId);
+
+        const duration = Math.round(performance.now() - startTime);
+        console.log(
+          `[RequestID: ${requestId}] Gerçek işleme süresi: ${duration} ms (Batch ${index}/${files.length})`
+        );
+
+        const brand = typeof result?.marka === "string" ? result.marka.trim() : "";
+        const product = typeof result?.urunAdi === "string" ? result.urunAdi.trim() : "";
+        const barcode = typeof result?.barkod === "string" ? result.barkod.trim() : "";
+
+        setBatchItems((prev) => [
+          ...prev,
+          {
+            id: requestId,
+            fileName: file.name,
+            thumbnail: compressedBase64,
+            marka: brand || "Bilinmiyor",
+            urunAdi: product || "",
+            barkod: barcode || "",
+            stok: "1",
+            status: "success",
+            saved: false,
+          },
+        ]);
+      } catch (err: any) {
+        // Hata Atlatma (Fault Tolerance): 503 veya Timeout olsa bile döngü KIRILMASIN
+        const duration = Math.round(performance.now() - startTime);
+        const errMsg = err?.message || "Google API / Sunucu hatası";
+        const is503 =
+          errMsg.includes("503") ||
+          errMsg.toLowerCase().includes("high demand") ||
+          errMsg.toLowerCase().includes("unavailable");
+        const isTimeout =
+          err?.name === "TimeoutError" ||
+          errMsg.includes("ZAMAN_ASIMI") ||
+          errMsg.toLowerCase().includes("timeout");
+
+        const reasonText = is503
+          ? `503 High Demand (${errMsg})`
+          : isTimeout
+            ? "Zaman Aşımı (15s)"
+            : errMsg;
+
+        console.error(
+          `[RequestID: ${requestId}] Batch (${index}/${files.length}) HATA - Es geçiliyor (${duration} ms): ${file.name} -> ${reasonText}`
+        );
+
+        setBatchErrorLogs((prev) => [
+          ...prev,
+          `#${index} [${file.name}]: ${reasonText}`,
+        ]);
+
+        setBatchItems((prev) => [
+          ...prev,
+          {
+            id: requestId,
+            fileName: file.name,
+            thumbnail: "",
+            marka: "",
+            urunAdi: "",
+            barkod: "",
+            stok: "0",
+            status: "error",
+            errorMessage: reasonText,
+            saved: false,
+          },
+        ]);
+      }
+
+      // 3. Google API limitlerine takılmamak için istekten sonra 3 saniye bekle
+      if (!batchCancelRef.current && index < files.length) {
+        setBatchWaitingCooldown(true);
+        await new Promise((res) => setTimeout(res, 3000));
+        setBatchWaitingCooldown(false);
+      }
+    }
+
+    setIsBatchProcessing(false);
+    setBatchWaitingCooldown(false);
+    setBatchCurrentImage(null);
+  };
+
+  // Batch item field updater
+  const updateBatchItem = (id: string, field: "marka" | "urunAdi" | "barkod" | "stok", value: string) => {
+    setBatchItems((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, [field]: value } : item))
+    );
+  };
+
+  // Save a single batch item to Google Sheets
+  const handleSaveBatchItem = async (id: string) => {
+    const target = batchItems.find((item) => item.id === id);
+    if (!target || target.saved || target.status !== "success") return;
+
+    const stockNum = parseInt(target.stok, 10);
+    const validStock = isNaN(stockNum) ? 0 : stockNum;
+
+    try {
+      const res = await saveToSheets(
+        target.marka || "Bilinmiyor",
+        target.urunAdi || "İsimsiz Ürün",
+        target.barkod || "",
+        validStock
+      );
+      if (res.success) {
+        setBatchItems((prev) =>
+          prev.map((item) => (item.id === id ? { ...item, saved: true } : item))
+        );
+        setToastMessage(`Kaydedildi: ${target.marka}`);
+        setTimeout(() => setToastMessage(null), 2500);
+      } else {
+        setBatchErrorLogs((prev) => [
+          ...prev,
+          `Kayıt Hatası [${target.fileName}]: ${res.error || "Bilinmeyen hata"}`,
+        ]);
+      }
+    } catch (err: any) {
+      setBatchErrorLogs((prev) => [
+        ...prev,
+        `Kayıt Hatası [${target.fileName}]: ${err?.message || "Sunucu hatası"}`,
+      ]);
+    }
+  };
+
+  // Save all unsaved successful batch items sequentially to Google Sheets
+  const handleSaveAllBatchItems = async () => {
+    if (isBatchSavingAll || isBatchProcessing) return;
+    const unsaved = batchItems.filter((item) => item.status === "success" && !item.saved);
+    if (unsaved.length === 0) return;
+
+    setIsBatchSavingAll(true);
+    let savedCount = 0;
+
+    for (const item of unsaved) {
+      const stockNum = parseInt(item.stok, 10);
+      const validStock = isNaN(stockNum) ? 0 : stockNum;
+
+      try {
+        const res = await saveToSheets(
+          item.marka || "Bilinmiyor",
+          item.urunAdi || "İsimsiz Ürün",
+          item.barkod || "",
+          validStock
+        );
+        if (res.success) {
+          savedCount += 1;
+          setBatchItems((prev) =>
+            prev.map((curr) => (curr.id === item.id ? { ...curr, saved: true } : curr))
+          );
+        } else {
+          setBatchErrorLogs((prev) => [
+            ...prev,
+            `Sheets Hatası [${item.fileName}]: ${res.error || "Kaydedilemedi"}`,
+          ]);
+        }
+      } catch (err: any) {
+        setBatchErrorLogs((prev) => [
+          ...prev,
+          `Sheets Hatası [${item.fileName}]: ${err?.message || "Bağlantı hatası"}`,
+        ]);
+      }
+    }
+
+    setIsBatchSavingAll(false);
+    if (savedCount > 0) {
+      setToastMessage(`Başarılı: ${savedCount} ürün E-Tabloya kaydedildi!`);
+      setTimeout(() => setToastMessage(null), 3200);
+    }
+  };
+
+  // Close Batch View and return to Camera State
+  const handleCloseBatchView = () => {
+    if (isBatchProcessing) {
+      batchCancelRef.current = true;
+    }
+    setIsBatchView(false);
+    setIsBatchProcessing(false);
+    setBatchWaitingCooldown(false);
+    setBatchCurrentImage(null);
+    setCurrentState("camera");
   };
 
   // Quick quantity increment/decrement helpers for warehouse use
@@ -479,6 +773,16 @@ export default function InventoryPage() {
         onChange={handleFileUpload}
       />
 
+      {/* Hidden multi-file input for Batch Processing ('Toplu Yükle') */}
+      <input
+        ref={batchFileInputRef}
+        type="file"
+        multiple
+        accept="image/*"
+        className="hidden"
+        onChange={handleBatchUpload}
+      />
+
       {/* Floating Success Toast Message */}
       {toastMessage && (
         <div className="fixed top-5 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-2xl bg-zinc-900/95 border-2 border-amber-400 text-amber-300 font-mono text-sm font-bold shadow-[0_8px_32px_rgba(217,119,6,0.35)] backdrop-blur-md flex items-center gap-2.5 animate-in fade-in slide-in-from-top-4 duration-300">
@@ -533,7 +837,7 @@ export default function InventoryPage() {
       {/* =========================================================================
           STATE 1: CAMERA STATE (Full screen environment camera + massive button)
           ========================================================================= */}
-      {currentState === "camera" && (
+      {!isBatchView && currentState === "camera" && (
         <div className="relative w-full h-full flex flex-col justify-between bg-black overflow-hidden">
           {/* Shutter flash animation effect */}
           {shutterEffect && (
@@ -648,32 +952,56 @@ export default function InventoryPage() {
                 >
                   Cihazdan Fotoğraf Yükle
                 </button>
+                <button
+                  type="button"
+                  onClick={() => batchFileInputRef.current?.click()}
+                  className="w-full py-3.5 px-4 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-amber-300 font-mono font-bold text-sm transition-all border border-amber-400/40 flex items-center justify-center gap-2"
+                >
+                  <Layers className="w-4 h-4" />
+                  Toplu Yükle (Çoklu Fotoğraf)
+                </button>
               </div>
             </div>
           )}
 
-          {/* Bottom Fixed Action Bar: MASSIVE 'FOTOĞRAF ÇEK' BUTTON */}
+          {/* Bottom Fixed Action Bar: MASSIVE 'FOTOĞRAF ÇEK' BUTTON + SLEEK 'Toplu Yükle' BUTTON */}
           <div className="relative z-20 w-full p-5 pb-safe pb-8 bg-gradient-to-t from-black via-black/80 to-transparent">
-            <div className="w-full max-w-md mx-auto">
+            <div className="w-full max-w-md mx-auto flex items-stretch gap-3">
               <button
                 type="button"
                 onClick={capturePhoto}
                 disabled={isAiProcessing}
-                className="group relative w-full h-20 sm:h-22 rounded-3xl bg-zinc-900 border-2 border-amber-400/80 hover:border-amber-400 active:scale-[0.97] transition-all duration-150 flex items-center justify-center gap-4 shadow-[0_8px_32px_rgba(217,119,6,0.28)] overflow-hidden cursor-pointer disabled:opacity-50"
+                className="group relative flex-1 h-20 sm:h-22 rounded-3xl bg-zinc-900 border-2 border-amber-400/80 hover:border-amber-400 active:scale-[0.97] transition-all duration-150 flex items-center justify-center gap-3 sm:gap-4 shadow-[0_8px_32px_rgba(217,119,6,0.28)] overflow-hidden cursor-pointer disabled:opacity-50"
               >
                 {/* Subtle gold ambient glow background */}
                 <div className="absolute inset-0 bg-gradient-to-r from-amber-500/10 via-amber-400/20 to-amber-500/10 group-hover:from-amber-500/20 group-hover:to-amber-500/20 transition-colors" />
 
                 {/* Shutter Button Ring Icon */}
-                <div className="relative flex items-center justify-center w-12 h-12 rounded-full border-2 border-amber-400 bg-amber-400/20 shadow-inner group-active:scale-90 transition-transform">
-                  <div className="w-8 h-8 rounded-full bg-amber-400 flex items-center justify-center text-black">
-                    <Camera className="w-5 h-5 fill-black stroke-black" />
+                <div className="relative flex items-center justify-center w-11 h-11 sm:w-12 sm:h-12 rounded-full border-2 border-amber-400 bg-amber-400/20 shadow-inner group-active:scale-90 transition-transform shrink-0">
+                  <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-amber-400 flex items-center justify-center text-black">
+                    <Camera className="w-4 h-4 sm:w-5 sm:h-5 fill-black stroke-black" />
                   </div>
                 </div>
 
                 {/* Button Text */}
-                <span className="relative text-xl sm:text-2xl font-black tracking-wider text-amber-300 font-mono uppercase drop-shadow-[0_2px_8px_rgba(0,0,0,0.8)]">
+                <span className="relative text-lg sm:text-2xl font-black tracking-wider text-amber-300 font-mono uppercase drop-shadow-[0_2px_8px_rgba(0,0,0,0.8)]">
                   FOTOĞRAF ÇEK
+                </span>
+              </button>
+
+              {/* Sleek 'Toplu Yükle' Button */}
+              <button
+                type="button"
+                onClick={() => batchFileInputRef.current?.click()}
+                disabled={isAiProcessing}
+                aria-label="Toplu Yükle"
+                className="group relative shrink-0 w-24 sm:w-28 h-20 sm:h-22 rounded-3xl bg-zinc-900/95 border border-zinc-700/80 hover:border-amber-400/70 active:scale-[0.97] transition-all duration-150 flex flex-col items-center justify-center gap-1.5 shadow-lg cursor-pointer disabled:opacity-50"
+              >
+                <div className="w-9 h-9 rounded-2xl bg-amber-400/10 border border-amber-400/30 flex items-center justify-center text-amber-400 group-hover:bg-amber-400/20 transition-colors">
+                  <Layers className="w-5 h-5" />
+                </div>
+                <span className="text-[10px] sm:text-[11px] font-mono font-bold tracking-wide text-zinc-200 group-hover:text-amber-300 uppercase">
+                  Toplu Yükle
                 </span>
               </button>
             </div>
@@ -684,7 +1012,7 @@ export default function InventoryPage() {
       {/* =========================================================================
           STATE 2: FORM STATE (Inputs: Marka, Ürün Adı, Barkod, Massive Stok Miktarı + Sheets Save)
           ========================================================================= */}
-      {currentState === "form" && (
+      {!isBatchView && currentState === "form" && (
         <div className="relative w-full h-full flex flex-col bg-black overflow-y-auto">
           {/* Header */}
           <header className="sticky top-0 z-20 flex items-center justify-between px-5 py-4 bg-black/90 backdrop-blur-md border-b border-zinc-900">
@@ -1032,6 +1360,309 @@ export default function InventoryPage() {
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {/* =========================================================================
+          BATCH PROCESSING VIEW (Toplu İşlem Modülü: Sıralı Kuyruk + 3s Bekleme + Hata Logu)
+          ========================================================================= */}
+      {isBatchView && (
+        <div className="relative w-full h-full flex flex-col bg-black overflow-y-auto">
+          {/* Header */}
+          <header className="sticky top-0 z-20 flex items-center justify-between px-5 py-4 bg-black/95 backdrop-blur-md border-b border-zinc-900">
+            <div className="flex items-center gap-2.5">
+              <button
+                type="button"
+                onClick={handleCloseBatchView}
+                aria-label="Kameraya Dön"
+                className="p-2 rounded-xl bg-zinc-900 border border-zinc-800 text-zinc-300 hover:border-zinc-700 active:scale-95 transition-all"
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                <span className="font-mono text-sm font-bold tracking-wider text-zinc-100">
+                  STOK<span className="text-amber-400">NET</span>
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1.5 text-[11px] font-mono tracking-wider text-amber-300 uppercase bg-amber-400/10 px-3 py-1 rounded-full border border-amber-400/30">
+              <Layers className="w-3.5 h-3.5 text-amber-400" />
+              Toplu İşlem
+            </div>
+          </header>
+
+          <div className="flex-1 w-full max-w-lg mx-auto flex flex-col p-5 gap-5">
+            {/* Progress Card ('İşleniyor: X / Y') */}
+            <div className="rounded-2xl bg-zinc-900/95 border border-zinc-800 p-4 shadow-xl flex flex-col gap-3.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  {isBatchProcessing ? (
+                    <Loader2 className="w-5 h-5 text-amber-400 animate-spin stroke-[2.5]" />
+                  ) : (
+                    <CheckCircle2 className="w-5 h-5 text-amber-400" />
+                  )}
+                  <span className="font-mono text-base sm:text-lg font-extrabold text-zinc-100">
+                    {isBatchProcessing
+                      ? `İşleniyor: ${batchProgress.current} / ${batchProgress.total}`
+                      : `Tamamlandı: ${batchProgress.current} / ${batchProgress.total}`}
+                  </span>
+                </div>
+
+                {isBatchProcessing && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      batchCancelRef.current = true;
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-red-500/15 hover:bg-red-500/25 border border-red-500/40 text-red-300 font-mono text-xs font-bold active:scale-95 transition-all"
+                  >
+                    Durdur
+                  </button>
+                )}
+              </div>
+
+              {/* Progress Bar */}
+              <div className="w-full h-2.5 rounded-full bg-zinc-950 border border-zinc-800 overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-amber-500 via-amber-400 to-amber-300 transition-all duration-300"
+                  style={{
+                    width: `${
+                      batchProgress.total > 0
+                        ? Math.round((batchProgress.current / batchProgress.total) * 100)
+                        : 0
+                    }%`,
+                  }}
+                />
+              </div>
+
+              {/* Status Counters & Cooldown */}
+              <div className="flex items-center justify-between text-xs font-mono">
+                <div className="flex items-center gap-3">
+                  <span className="text-emerald-400 font-bold">
+                    ✓ Başarılı: {batchItems.filter((i) => i.status === "success").length}
+                  </span>
+                  <span className="text-red-400 font-bold">
+                    ✕ Es Geçilen: {batchItems.filter((i) => i.status === "error").length}
+                  </span>
+                </div>
+
+                {batchWaitingCooldown && (
+                  <div className="flex items-center gap-1.5 text-amber-300 animate-pulse">
+                    <Clock className="w-3.5 h-3.5" />
+                    <span>3sn bekleniyor...</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Current Processing Thumbnail */}
+              {isBatchProcessing && batchCurrentImage && (
+                <div className="flex items-center gap-3 pt-2 border-t border-zinc-800/80">
+                  <div className="relative w-12 h-12 rounded-xl overflow-hidden border border-amber-400/40 shrink-0">
+                    <Image
+                      src={batchCurrentImage}
+                      alt="İşlenen ürün"
+                      fill
+                      sizes="48px"
+                      className="object-cover"
+                      unoptimized
+                    />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[11px] font-mono text-amber-300 font-semibold truncate">
+                      {batchWaitingCooldown
+                        ? "Google API limit koruması: Sonraki fotoğraf için 3sn bekleniyor..."
+                        : "Etiket ve barkod okunuyor..."}
+                    </div>
+                    <div className="text-[10px] font-mono text-zinc-500">
+                      640x480 sıkıştırma aktif • Hata atlatma korumalı kuyruk
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Error Log Box (Fault Tolerance - Skipped Photos) */}
+            {batchErrorLogs.length > 0 && (
+              <div className="rounded-2xl bg-red-950/25 border border-red-500/30 p-3.5 flex flex-col gap-2">
+                <div className="flex items-center gap-2 text-xs font-mono font-bold text-red-300">
+                  <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                  <span>Hata Logu / Es Geçilenler ({batchErrorLogs.length})</span>
+                </div>
+                <div className="max-h-28 overflow-y-auto flex flex-col gap-1 pr-1">
+                  {batchErrorLogs.map((log, i) => (
+                    <div
+                      key={i}
+                      className="text-[11px] font-mono text-red-200/85 bg-black/40 px-2.5 py-1.5 rounded-lg border border-red-500/15"
+                    >
+                      {log}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Processed Items List */}
+            <div className="flex flex-col gap-3">
+              {batchItems.map((item, idx) => (
+                <div
+                  key={item.id}
+                  className={`rounded-2xl border p-3.5 transition-all ${
+                    item.status === "error"
+                      ? "bg-zinc-950/80 border-red-500/25 opacity-80"
+                      : item.saved
+                        ? "bg-zinc-900/60 border-emerald-500/40"
+                        : "bg-zinc-900/95 border-zinc-800"
+                  }`}
+                >
+                  {item.status === "error" ? (
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <XCircle className="w-5 h-5 text-red-400 shrink-0" />
+                        <div className="min-w-0">
+                          <div className="text-xs font-mono font-bold text-zinc-200 truncate">
+                            #{idx + 1} • {item.fileName}
+                          </div>
+                          <div className="text-[11px] font-mono text-red-300 truncate">
+                            Es Geçildi: {item.errorMessage}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-center gap-3">
+                        {item.thumbnail && (
+                          <div className="relative w-14 h-14 rounded-xl overflow-hidden border border-zinc-700 shrink-0">
+                            <Image
+                              src={item.thumbnail}
+                              alt={item.fileName}
+                              fill
+                              sizes="56px"
+                              className="object-cover"
+                              unoptimized
+                            />
+                          </div>
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[10px] font-mono text-zinc-400 truncate">
+                              #{idx + 1} • {item.fileName}
+                            </span>
+                            {item.saved ? (
+                              <span className="text-[10px] font-mono font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/30 shrink-0">
+                                Kaydedildi ✓
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => handleSaveBatchItem(item.id)}
+                                disabled={isBatchSavingAll}
+                                className="text-[10px] font-mono font-bold text-amber-300 bg-amber-400/10 hover:bg-amber-400/20 px-2.5 py-1 rounded-lg border border-amber-400/30 active:scale-95 transition-all shrink-0 disabled:opacity-50"
+                              >
+                                Kaydet
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <input
+                          type="text"
+                          value={item.marka}
+                          disabled={item.saved || isBatchSavingAll}
+                          onChange={(e) => updateBatchItem(item.id, "marka", e.target.value)}
+                          placeholder="Marka"
+                          className="h-10 px-3 rounded-xl bg-zinc-950 border border-zinc-800 focus:border-amber-400 text-zinc-100 text-xs font-medium outline-none disabled:opacity-60"
+                        />
+                        <input
+                          type="text"
+                          value={item.urunAdi}
+                          disabled={item.saved || isBatchSavingAll}
+                          onChange={(e) => updateBatchItem(item.id, "urunAdi", e.target.value)}
+                          placeholder="Ürün Adı"
+                          className="h-10 px-3 rounded-xl bg-zinc-950 border border-zinc-800 focus:border-amber-400 text-zinc-100 text-xs font-medium outline-none disabled:opacity-60"
+                        />
+                        <input
+                          type="text"
+                          value={item.barkod}
+                          disabled={item.saved || isBatchSavingAll}
+                          onChange={(e) => updateBatchItem(item.id, "barkod", e.target.value)}
+                          placeholder="Barkod (İsteğe Bağlı)"
+                          className="h-10 px-3 rounded-xl bg-zinc-950 border border-zinc-800 focus:border-amber-400 text-zinc-100 text-xs font-mono outline-none disabled:opacity-60"
+                        />
+                        <div className="flex items-center gap-2">
+                          <span className="text-[11px] font-mono font-bold text-amber-400 uppercase shrink-0">
+                            Stok:
+                          </span>
+                          <input
+                            type="number"
+                            inputMode="numeric"
+                            value={item.stok}
+                            disabled={item.saved || isBatchSavingAll}
+                            onChange={(e) => updateBatchItem(item.id, "stok", e.target.value)}
+                            placeholder="1"
+                            className="w-full h-10 px-3 rounded-xl bg-zinc-950 border border-amber-500/50 focus:border-amber-400 text-amber-400 text-sm font-mono font-bold outline-none disabled:opacity-60"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* Bottom Actions for Batch View */}
+            {!isBatchProcessing && (
+              <div className="flex flex-col gap-3 pt-2 pb-safe pb-6">
+                {batchItems.some((item) => item.status === "success" && !item.saved) && (
+                  <button
+                    type="button"
+                    onClick={handleSaveAllBatchItems}
+                    disabled={isBatchSavingAll}
+                    className="w-full h-16 rounded-2xl bg-gradient-to-r from-amber-400 via-amber-300 to-amber-500 text-black font-extrabold text-base sm:text-lg font-mono tracking-wider shadow-[0_6px_28px_rgba(217,119,6,0.35)] hover:brightness-105 active:scale-[0.98] transition-all flex items-center justify-center gap-3 cursor-pointer disabled:opacity-50"
+                  >
+                    {isBatchSavingAll ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin text-black stroke-[3]" />
+                        <span>E-TABLOYA KAYDEDİLİYOR...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Check className="w-5 h-5 stroke-[3]" />
+                        <span>
+                          TÜMÜNÜ E-TABLOYA KAYDET (
+                          {batchItems.filter((i) => i.status === "success" && !i.saved).length})
+                        </span>
+                      </>
+                    )}
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => batchFileInputRef.current?.click()}
+                  disabled={isBatchSavingAll}
+                  className="w-full h-14 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-amber-400/40 text-amber-300 font-bold text-sm font-mono tracking-wide active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <Layers className="w-4 h-4" />
+                  YENİ TOPLU YÜKLEME YAP
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleCloseBatchView}
+                  disabled={isBatchSavingAll}
+                  className="w-full h-14 rounded-xl bg-zinc-900 hover:bg-zinc-800/90 border border-zinc-800 text-zinc-300 font-medium text-sm font-mono tracking-wide active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <RotateCcw className="w-4 h-4 text-zinc-400" />
+                  KAMERAYA DÖN
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </main>
